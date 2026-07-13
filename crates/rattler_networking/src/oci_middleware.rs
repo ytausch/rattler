@@ -5,15 +5,15 @@ use std::{
 };
 
 use http::{
-    header::{ACCEPT, AUTHORIZATION},
     Extensions,
+    header::{ACCEPT, AUTHORIZATION},
 };
 use reqwest::{Request, Response};
 use reqwest_middleware::{Middleware, Next};
 use serde::Deserialize;
 use url::{ParseError, Url};
 
-use crate::{mirror_middleware::create_404_response, LazyClient};
+use crate::{LazyClient, mirror_middleware::create_404_response};
 
 #[derive(thiserror::Error, Debug)]
 enum OciMiddlewareError {
@@ -31,6 +31,9 @@ enum OciMiddlewareError {
 
     #[error("Layer not found")]
     LayerNotFound,
+
+    #[error("Invalid OCI URL '{0}': {1}")]
+    InvalidUrl(Url, &'static str),
 }
 
 /// Middleware to handle `oci://` URLs
@@ -144,9 +147,14 @@ impl OCIUrl {
         format!("https://{}/v2/{}/blobs/{}", self.host, self.path, sha256).parse()
     }
 
-    pub fn new(url: &Url) -> Result<Self, ParseError> {
+    pub fn new(url: &Url) -> Result<Self, OciMiddlewareError> {
         // get filename (last segment of path)
-        let filename = url.path_segments().unwrap().next_back().unwrap();
+        let filename = url
+            .path_segments()
+            .and_then(|mut s| s.next_back())
+            .ok_or_else(|| {
+                OciMiddlewareError::InvalidUrl(url.clone(), "URL has no path segments")
+            })?;
 
         let mut res = OCIUrl {
             url: url.clone(),
@@ -162,14 +170,34 @@ impl OCIUrl {
         // because we don't want to introduce cyclic dependencies
         if let Some(archive_name) = filename.strip_suffix(".conda") {
             let parts = archive_name.rsplitn(3, '-').collect::<Vec<&str>>();
-            computed_filename = parts[2].to_string();
-            res.tag = version_build_tag(&format!("{}-{}", parts[1], parts[0]));
-            res.media_type = "application/vnd.conda.package.v2".to_string();
+            match parts.as_slice() {
+                [build, version, name] => {
+                    computed_filename = name.to_string();
+                    res.tag = version_build_tag(&format!("{version}-{build}"));
+                    res.media_type = "application/vnd.conda.package.v2".to_string();
+                }
+                _ => {
+                    return Err(OciMiddlewareError::InvalidUrl(
+                        url.clone(),
+                        "package filename must have the form name-version-build.conda",
+                    ));
+                }
+            }
         } else if let Some(archive_name) = filename.strip_suffix(".tar.bz2") {
             let parts = archive_name.rsplitn(3, '-').collect::<Vec<&str>>();
-            computed_filename = parts[2].to_string();
-            res.tag = version_build_tag(&format!("{}-{}", parts[1], parts[0]));
-            res.media_type = "application/vnd.conda.package.v1".to_string();
+            match parts.as_slice() {
+                [build, version, name] => {
+                    computed_filename = name.to_string();
+                    res.tag = version_build_tag(&format!("{version}-{build}"));
+                    res.media_type = "application/vnd.conda.package.v1".to_string();
+                }
+                _ => {
+                    return Err(OciMiddlewareError::InvalidUrl(
+                        url.clone(),
+                        "package filename must have the form name-version-build.tar.bz2",
+                    ));
+                }
+            }
         } else if filename.starts_with("repodata.json") {
             computed_filename = "repodata.json".to_string();
             if filename == "repodata.json" {
@@ -188,7 +216,7 @@ impl OCIUrl {
             computed_filename = format!("zzz{computed_filename}");
         }
 
-        res.url = url.join(&computed_filename).unwrap();
+        res.url = url.join(&computed_filename)?;
         res.path = res.url.path().trim_start_matches('/').to_string();
         Ok(res)
     }
@@ -304,7 +332,7 @@ mod tests {
     use crate::OciMiddleware;
 
     // test pulling an image from OCI registry
-    #[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
+    #[cfg(any(feature = "rustls", feature = "native-tls"))]
     #[tokio::test]
     async fn test_oci_middleware() {
         let client = reqwest::Client::new();
@@ -327,17 +355,15 @@ mod tests {
         // write out to tempfile
         assert_eq!(response.status(), 200);
         // check that the bytes are the same
-        let mut hasher = Sha256::new();
-        std::io::copy(&mut response.bytes().await.unwrap().as_ref(), &mut hasher).unwrap();
-        let hash = hasher.finalize();
+        let hash = Sha256::digest(response.bytes().await.unwrap());
         assert_eq!(
-            format!("{hash:x}"),
+            hex::encode(hash),
             "8485a64911c7011c0270b8266ab2bffa1da41c59ac4f0a48000c31d4f4a966dd"
         );
     }
 
     // test pulling an image from OCI registry
-    #[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
+    #[cfg(any(feature = "rustls", feature = "native-tls"))]
     #[tokio::test]
     async fn test_oci_middleware_repodata() {
         let client = reqwest::Client::new();
